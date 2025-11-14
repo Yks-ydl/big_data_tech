@@ -1,0 +1,7 @@
+# for data_processing module
+
+data_processing/__pycache__
+data_processing/url_data/*.csv
+__pycache__
+.vscode
+.ipynb
