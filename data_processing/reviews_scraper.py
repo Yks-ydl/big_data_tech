@@ -18,6 +18,7 @@ class IMDBReviewScraper:
         self.service = ChromeService()
         options = webdriver.ChromeOptions()
         self.driver = webdriver.Chrome(service=self.service, options=options)
+        self.driver.set_page_load_timeout(10)
         self.urls = pd.read_csv(urls_file)
         self.reviews_data = pd.DataFrame(columns=['title','imdb_id', 'reviews_c','reviews_u'])
         self.wrong_urls = pd.DataFrame(columns=['title','imdb_id','url','error'])
@@ -83,15 +84,13 @@ class IMDBReviewScraper:
     def close(self):
         self.driver.quit()
     def run(self):
-        
+        signal.signal(signal.SIGINT, self.save_and_exit)
         count_success = 0
         count_worng_urls = 0
         count_url_without_reviews = 0
         total_urls = len(self.urls)
         start_time = time.time()
-        signal.signal(signal.SIGINT, self.save_and_exit)
         for i in range(len(self.urls)):
-            
             print(f"Processing {self.file_name}----{i+1}/{total_urls}")
             status_code = self.get_url_code(self.urls.iloc[i]['url']) 
             if status_code != 'success':
@@ -110,20 +109,25 @@ class IMDBReviewScraper:
                 WebDriverWait(self.driver, 1).until(EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler"))).click()
             except:
                 pass
-            
-            button_list = self.driver.find_element(By.CLASS_NAME,"tabs-wrap")
-            buttons = button_list.find_elements(By.TAG_NAME, "rt-button")
-            button_c = buttons[1]
-            
-            button_c.click()
-            critic_reviews = self.scrape_reviews_c()
-            # print(critic_reviews)
-            # print (f"Scraped user reviews for {title}, url: {url}")
-            button_list = self.driver.find_element(By.CLASS_NAME,"tabs-wrap")
-            buttons = button_list.find_elements(By.TAG_NAME, "rt-button")
-            button_u = buttons[2]
-            button_u.click()
-            user_reviews = self.scrape_reviews_u()
+            try:
+                button_list = self.driver.find_element(By.CLASS_NAME,"tabs-wrap")
+                buttons = button_list.find_elements(By.TAG_NAME, "rt-button")
+                button_c = buttons[1]
+                
+                button_c.click()
+                critic_reviews = self.scrape_reviews_c()
+                # print(critic_reviews)
+                # print (f"Scraped user reviews for {title}, url: {url}")
+                button_list = self.driver.find_element(By.CLASS_NAME,"tabs-wrap")
+                buttons = button_list.find_elements(By.TAG_NAME, "rt-button")
+                button_u = buttons[2]
+                button_u.click()
+                user_reviews = self.scrape_reviews_u()
+            except Exception as e:
+                count_worng_urls +=1
+                print (f"Wrong URL: {count_worng_urls},Successfully scraped {count_success},URL without reviews:{count_url_without_reviews}, out of {i+1} movies.")
+                self.wrong_urls.loc[i] = {'title': title, 'imdb_id': imdb_id, 'url': url, 'error': str(e)}
+                continue
             # print(user_reviews)
             if len(critic_reviews)+len(user_reviews) !=0:
                 count_success +=1
