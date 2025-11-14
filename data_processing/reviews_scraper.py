@@ -10,7 +10,7 @@ import requests
 import os
 import signal
 import sys
-
+import csv
 
 class IMDBReviewScraper:
     def __init__(self, urls_file):
@@ -22,6 +22,19 @@ class IMDBReviewScraper:
         self.urls = pd.read_csv(urls_file)
         self.reviews_data = pd.DataFrame(columns=['title','imdb_id', 'reviews_c','reviews_u'])
         self.wrong_urls = pd.DataFrame(columns=['title','imdb_id','url','error'])
+        self.re_flile_name = self.file_name.replace('./url_data/imdb_reviews','output_imdb_reviews')
+        self.reviews_data.to_csv(self.re_flile_name, index=False)
+        self.wrong_urls_file_name = self.file_name.replace('./url_data/imdb_reviews','wrong_urls_imdb_reviews')
+        self.wrong_urls.to_csv(self.wrong_urls_file_name, index=False)
+    
+    def save_r(self):
+        
+        save_path = self.re_flile_name
+        self.reviews_data.to_csv(save_path, index=False)
+    def save_w(self):
+        
+        save_path = self.wrong_urls_file_name
+        self.wrong_urls.to_csv(save_path, index=False)
         
     def save_and_exit(self, signum, frame):
         """捕获信号后保存并退出"""
@@ -91,12 +104,17 @@ class IMDBReviewScraper:
         total_urls = len(self.urls)
         start_time = time.time()
         for i in range(len(self.urls)):
+
+            url_file_upgrade = self.urls.iloc[i+1:]
+            url_file_upgrade.to_csv(self.file_name, index=False)            
+
             print(f"Processing {self.file_name}----{i+1}/{total_urls}")
             status_code = self.get_url_code(self.urls.iloc[i]['url']) 
             if status_code != 'success':
                 count_worng_urls +=1
                 print (f"Wrong URL: {count_worng_urls},Successfully scraped {count_success},URL without reviews:{count_url_without_reviews}, out of {i+1} movies.")
                 self.wrong_urls.loc[i] = {'title': self.urls.iloc[i]['title'], 'imdb_id': self.urls.iloc[i]['imdb_id'], 'url': self.urls.iloc[i]['url'], 'error': status_code}
+                self.save_w()
                 continue
 
             url = self.urls.iloc[i]['url']
@@ -127,16 +145,22 @@ class IMDBReviewScraper:
                 count_worng_urls +=1
                 print (f"Wrong URL: {count_worng_urls},Successfully scraped {count_success},URL without reviews:{count_url_without_reviews}, out of {i+1} movies.")
                 self.wrong_urls.loc[i] = {'title': title, 'imdb_id': imdb_id, 'url': url, 'error': str(e)}
+                self.save_w()
                 continue
             # print(user_reviews)
             if len(critic_reviews)+len(user_reviews) !=0:
                 count_success +=1
                 print (f"Wrong URL: {count_worng_urls},Successfully scraped {count_success},URL without reviews:{count_url_without_reviews}, out of {i+1} movies.")
                 self.reviews_data.loc[i] = [ title,  imdb_id, critic_reviews, user_reviews]
+                self.save_r()
             else:
                 count_url_without_reviews +=1
                 print (f"Wrong URL: {count_worng_urls},Successfully scraped {count_success},URL without reviews:{count_url_without_reviews}, out of {i+1} movies.")
         self.close()
+        if os.path.exists(self.file_name):
+            file_path = self.file_name
+        # 删除文件
+            os.remove(file_path)
         end_time = time.time()
         t = end_time - start_time
         print(f"Time taken to read URLs file: {t} seconds")
@@ -153,7 +177,4 @@ if __name__ == "__main__":
         file_name = filenames[i] 
         scraper = IMDBReviewScraper(urls_file=f"{target_dir}/{file_name}")
         reviews_data, wrong_urls = scraper.run()
-        re_flile_name = file_name.replace('imdb_reviews','output_imdb_reviews')
-        reviews_data.to_csv(re_flile_name, index=False)
-        wrong_urls_file_name = file_name.replace('imdb_reviews','wrong_urls_imdb_reviews')
-        wrong_urls.to_csv(wrong_urls_file_name, index=False)
+       
