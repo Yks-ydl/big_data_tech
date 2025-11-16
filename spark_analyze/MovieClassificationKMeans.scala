@@ -1,61 +1,28 @@
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.ml.clustering.KMeans
 import org.apache.spark.ml.clustering.KMeansModel
-import org.apache.spark.ml.feature.{VectorAssembler, StandardScaler}
+import org.apache.spark.ml.clustering.KMeans
+import org.apache.spark.ml.feature.{VectorAssembler, StandardScaler, StandardScalerModel}
 import org.apache.spark.ml.Pipeline
 import org.apache.spark.sql.functions._
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.ml.linalg.DenseVector
 
-object MovieClassificationKMeans {
+object ClusterToRatingMapping {
   def main(args: Array[String]): Unit = {
     val spark = SparkSession.builder()
-      .appName("MovieFourClassificationKMeans")
+      .appName("ClusterToRatingMapping")
       .master("local[*]")
       .getOrCreate()
 
     import spark.implicits._
 
-    // 1. Read multiple Parquet files
+    // 1. Read data and preprocess
     val parquetDir = "/data/movie_parquets/"
     val rawDF = spark.read.parquet(parquetDir)
-    println(s"Successfully read Parquet files, total records: ${rawDF.count()}")
-
-    // 2. Data preprocessing: Filter valid data + Convert all array fields to strings (core fix)
     val processedDF = rawDF
-      // Filter records with complete ratings
       .filter(col("rt_tomatometer_rating").isNotNull && col("rt_audience_rating").isNotNull)
-      // Calculate rating discrepancy and average rating
-      .withColumn("rating_discrepancy", abs(col("rt_tomatometer_rating") - col("rt_audience_rating")))
-      .withColumn("avg_rating", (col("rt_tomatometer_rating") + col("rt_audience_rating")) / 2)
-      // Convert array to string: genres_tmdb (movie genres)
-      .withColumn("genres_tmdb_str", concat_ws(",", col("genres_tmdb")))
-      .drop("genres_tmdb")
-      .withColumnRenamed("genres_tmdb_str", "genres_tmdb")
-      // Convert array to string: main_cast_names (main cast names)
-      .withColumn("main_cast_names_str", concat_ws(",", col("main_cast_names")))
-      .drop("main_cast_names")
-      .withColumnRenamed("main_cast_names_str", "main_cast_names")
-      // Convert array to string: main_cast_characters (main cast characters)
-      .withColumn("main_cast_characters_str", concat_ws(",", col("main_cast_characters")))
-      .drop("main_cast_characters")
-      .withColumnRenamed("main_cast_characters_str", "main_cast_characters")
-      // Convert array to string: director_names (director names)
-      .withColumn("director_names_str", concat_ws(",", col("director_names")))
-      .drop("director_names")
-      .withColumnRenamed("director_names_str", "director_names")
-      // Convert array to string: writer_names (writer names)
-      .withColumn("writer_names_str", concat_ws(",", col("writer_names")))
-      .drop("writer_names")
-      .withColumnRenamed("writer_names_str", "writer_names")
-      // Convert array to string: producer_names (producer names)
-      .withColumn("producer_names_str", concat_ws(",", col("producer_names")))
-      .drop("producer_names")
-      .withColumnRenamed("producer_names_str", "producer_names")
 
-    println(s"Valid records after filtering: ${processedDF.count()} (require both critic and audience ratings)")
-
-    // 3. Feature engineering
+    // 2. Feature engineering (assembling + standardization)
     val assembler = new VectorAssembler()
       .setInputCols(Array("rt_tomatometer_rating", "rt_audience_rating"))
       .setOutputCol("features")
@@ -66,11 +33,10 @@ object MovieClassificationKMeans {
       .setWithMean(true)
       .setWithStd(true)
 
-    // 4. KMeans clustering
+    // 3. Train KMeans model
     val kmeans = new KMeans()
       .setK(4)
       .setSeed(42)
-      .setMaxIter(100)
       .setFeaturesCol("scaledFeatures")
       .setPredictionCol("cluster_id")
 
@@ -78,64 +44,61 @@ object MovieClassificationKMeans {
     val model = pipeline.fit(processedDF)
     val predictionDF = model.transform(processedDF)
 
-    // 5. Print cluster centers
-    val clusterCenters = model.stages(2).asInstanceOf[KMeansModel].clusterCenters
-    println("\nCluster centers (standardized):")
-    clusterCenters.foreach { center =>
-      println(center.asInstanceOf[DenseVector].values.mkString(","))
-    }
+    // 4. Extract mean and standard deviation from the standardization model (for restoring original ratings)
+    val scalerModel = model.stages(1).asInstanceOf[StandardScalerModel]
+    val mean = scalerModel.mean  // Mean of original features [tomatometer rating mean, audience rating mean]
+    val std = scalerModel.std    // Standard deviation of original features [tomatometer rating std, audience rating std]
 
-    // 6. Classification logic
-    val classifyMovie = udf((avgRating: Double, discrepancy: Double) => {
-      val highScoreThreshold = 70.0
-      val highDiscrepancyThreshold = 15.0
-      (avgRating >= highScoreThreshold, discrepancy >= highDiscrepancyThreshold) match {
-        case (true, true) => "High Score & High Discrepancy"
-        case (true, false) => "High Score & Low Discrepancy"
-        case (false, true) => "Low Score & High Discrepancy"
-        case (false, false) => "Low Score & Low Discrepancy"
-      }
-    })
+    // 5. Extract cluster centers (after standardization) and convert to original ratings
+    val kmeansModel = model.stages(2).asInstanceOf[KMeansModel]
+    val clusterCenters = kmeansModel.clusterCenters  // Standardized cluster centers (4 clusters)
 
-    // 7. Build result DataFrame (fix: remove duplicate rating_discrepancy)
-    val resultDF = predictionDF
-      .withColumn("movie_category", classifyMovie(col("avg_rating"), col("rating_discrepancy")))
-      .select(
-        (processedDF.columns.map(col) ++ Seq(
-          col("avg_rating").alias("average_rating"),  // Only keep non-duplicate fields
-          col("cluster_id").alias("cluster_id"),
-          col("movie_category").alias("movie_category")
-        )): _*
+    // Convert each cluster center to original rating range
+    val clusterMapping = clusterCenters.zipWithIndex.map { case (center, clusterId) =>
+      val tomometerRaw = center(0) * std(0) + mean(0)  // Restore tomatometer rating
+      val audienceRaw = center(1) * std(1) + mean(1)    // Restore audience rating
+      (clusterId, tomometerRaw, audienceRaw)
+    }.toSeq.toDF("cluster_id", "center_tomometer", "center_audience")
+
+    // 6. Define threshold for high/low ratings (e.g., 70 points, adjust based on actual data distribution)
+    val highThreshold = 60.0
+
+    // 7. Label each cluster center with category (both high/critic high audience low/etc.)
+    val clusterToCategory = clusterMapping
+      .withColumn("category", 
+        when(col("center_tomometer") >= highThreshold && col("center_audience") >= highThreshold, 
+          "high_tomatometer_high_audience")
+        .when(col("center_tomometer") >= highThreshold && col("center_audience") < highThreshold, 
+          "high_tomatometer_low_audience")
+        .when(col("center_tomometer") < highThreshold && col("center_audience") >= highThreshold, 
+          "low_tomatometer_high_audience")
+        .otherwise("low_tomatometer_low_audience")
       )
 
-    // 8. Export CSV (all fields are basic types, export normally)
-    val outputPath = "/data/movie_classification_result.csv"
+    // 8. Print mapping between cluster IDs and rating categories (key result)
+    println("=== Mapping between Cluster ID and Rating Category ===")
+    clusterToCategory.show(false)
+
+    // 9. Associate mapping with original data to get each movie's category
+    val finalDF = predictionDF
+      .join(clusterToCategory.select("cluster_id", "category"), "cluster_id")
+      .drop("features", "scaledFeatures", "cluster_id")
+    finalDF.show(5)
+    
+    // 10. Output results (Parquet format)
+    val outputPath = "/data/movie_cluster_with_category.parquet"
     val fs = FileSystem.get(spark.sparkContext.hadoopConfiguration)
     if (fs.exists(new Path(outputPath))) fs.delete(new Path(outputPath), true)
 
-    resultDF.write
-      .mode("overwrite")
-      .option("header", "true")
-      .option("encoding", "utf-8")
-      .csv(outputPath)
+    finalDF.write.mode("overwrite").parquet(outputPath)
+    println(s"\nResults saved to: $outputPath")
 
-    // 9. Print classification statistics
-    println("\nMovie Category Statistics:")
-    resultDF.groupBy("movie_category")
-      .agg(
-        count("*").alias("count"),
-        round(count("*") / resultDF.count() * 100, 2).alias("percentage(%)")
-      )
-      .show(false)
-
-    // 10. Prompt to merge CSV files
-    println(s"\nResults exported to directory: $outputPath")
-    println("Command to merge into a single CSV file:")
-    println(s"cat $outputPath/*.csv > /data/movie_classification_full.csv")
+    // 11. Print number of movies in each category (verify results)
+    println("\n=== Number of Movies in Each Category ===")
+    finalDF.groupBy("category").count().show(false)
 
     spark.stop()
   }
 }
 
-// Auto-execute
-MovieClassificationKMeans.main(Array())
+ClusterToRatingMapping.main(Array())

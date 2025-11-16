@@ -5,4 +5,7 @@ data_processing/url_data
 __pycache__
 .vscode
 .ipynb
+.bsp
+.metals
+.scala-build
 *.csv
